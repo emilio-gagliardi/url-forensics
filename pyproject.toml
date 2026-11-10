@@ -18,3 +18,6 @@ url-inspect = "url_forensics.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["url_forensics*"]
+
+[tool.setuptools.package-data]
+url_forensics = ["hooks.js"]

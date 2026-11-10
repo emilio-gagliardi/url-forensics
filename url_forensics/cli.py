@@ -84,6 +84,22 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
     if args.mode in {"http", "browser"}:
         report["http"] = http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout,
                                     max_body_bytes=args.max_body_bytes)
+    if args.mode in {"http", "browser"} and args.repeat > 1:
+        captures = [report["http"]] + [http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout, max_body_bytes=args.max_body_bytes) for _ in range(args.repeat - 1)]
+        report["http_repeats"] = captures
+        hashes, targets = {}, {}
+        for i, capture in enumerate(captures):
+            for hop in capture.get("requests", []):
+                response = hop.get("http", {})
+                digest = response.get("payload", {}).get("sha256_captured")
+                if digest:
+                    hashes.setdefault(digest, []).append(i + 1)
+                for item in response.get("content_indicators", {}).get("links_and_forms", []):
+                    if item.get("refresh"):
+                        targets.setdefault(item["refresh"], []).append(i + 1)
+                if hop.get("redirect"):
+                    targets.setdefault(hop["redirect"]["to"], []).append(i + 1)
+        report["repeat_comparison"] = {"body_hashes": hashes, "redirect_targets": targets, "limitation": "Same configuration; variability does not prove cloaking or identify its cause."}
     if args.mode == "browser":
         from .browser import observe
         profiles = ["linux", "windows-ua"] if args.profile == "both" else [args.profile]
@@ -92,7 +108,8 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
             try:
                 result = asyncio.run(observe(url, target_dir, profile=profile,
                                   timeout_ms=int(args.timeout * 1000), max_requests=args.max_requests,
-                                  settle_ms=args.settle_ms, max_body_bytes=args.max_body_bytes))
+                                  settle_ms=args.settle_ms, max_body_bytes=args.max_body_bytes,
+                                  ignore_https_errors=args.ignore_https_errors, screenshot=args.screenshot))
             except Exception as exc:
                 result = {"profile": profile, "error": f"{type(exc).__name__}: {str(exc)[:500]}",
                           "requests": [], "responses": [], "blocked": [], "downloads_cancelled": []}
@@ -122,7 +139,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-redirects", type=int, default=6)
     parser.add_argument("--settle-ms", type=int, default=2000)
     parser.add_argument("--max-body-bytes", type=int, default=262144, help="Payload bytes captured per response (1–1048576)")
+    parser.add_argument("--ignore-https-errors", action="store_true", help="Allow invalid browser TLS certificates")
+    parser.add_argument("--screenshot", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--repeat", type=int, default=1, help="Number of HTTP captures (1-10)")
     args = parser.parse_args(argv)
+    if not 1 <= args.repeat <= 10:
+        parser.error("repeat must be 1-10")
     if not 1 <= args.max_body_bytes <= 1048576:
         parser.error("max-body-bytes must be 1–1048576")
     if args.timeout < 1 or args.timeout > 60 or not 1 <= args.max_requests <= 500 or not 0 <= args.max_redirects <= 12 or not 0 <= args.settle_ms <= 10000:

@@ -343,3 +343,12 @@ pins public addresses at every server redirect. HEAD retains its original direct
 pinned transport. Proxy denials and failed browser requests are collection gaps,
 not evidence that a target is safe. No forms or extracted resource links are
 actively followed by the HTTP probe.
+
+Browser visits record bounded, best-effort JavaScript hook events and write the
+rendered DOM and captured text responses as inert `.txt` artifacts. They are
+untrusted and may contain sensitive information. Hooks can be bypassed and do
+not reliably intercept location assignments. The Windows profile is UA-only,
+not a Windows VM. `--no-screenshot` disables the default screenshot;
+`--ignore-https-errors` permits invalid browser TLS certificates. `--repeat N`
+repeats HTTP GET collection (up to 10) and groups hashes and redirect targets;
+this does not establish which factor caused differences.

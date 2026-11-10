@@ -6,6 +6,7 @@ throwaway cloud VM/container with egress controls and no credentials.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from urllib.parse import urlsplit
@@ -33,7 +34,7 @@ def safe_headers(headers: dict) -> dict:
 
 async def observe(raw_url: str, output: Path, profile: str = "linux",
                   timeout_ms: int = 15000, max_requests: int = 100,
-                  settle_ms: int = 2000, max_body_bytes: int = 262144) -> dict:
+                  settle_ms: int = 2000, max_body_bytes: int = 262144, ignore_https_errors: bool = False, screenshot: bool = True) -> dict:
     """Observe a single site visit with no clicks, form posts or stored downloads."""
     try:
         from playwright.async_api import async_playwright
@@ -74,12 +75,21 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
         )
         context = await browser.new_context(
             user_agent=ua, accept_downloads=False, service_workers="block",
-            permissions=[], ignore_https_errors=False, java_script_enabled=True,
+            permissions=[], ignore_https_errors=ignore_https_errors, java_script_enabled=True,
             viewport={"width": 1280, "height": 900},
             record_har_path=str(output / "traffic.har"), record_har_content="omit",
             record_har_mode="full",
         )
         context.set_default_timeout(timeout_ms)
+        report["javascript_events"] = []
+        async def log_event(source, kind, value):
+            if len(report["javascript_events"]) < 500:
+                report["javascript_events"].append({"kind": str(kind)[:80], "value": str(value)[:4096], "frame_url": source["frame"].url[:2048]})
+        await context.expose_binding("__forensics_log", log_event)
+        await context.add_init_script(path=str(Path(__file__).with_name("hooks.js")))
+        report["javascript_hook_limitations"] = "Best effort; pages can bypass or overwrite hooks. Location assignments and calls in early-navigated frames may be missed."
+        report["profile_limitations"] = "UA only; not Windows emulation" if profile == "windows-ua" else "Linux Chromium"
+        report["ignore_https_errors"] = ignore_https_errors
 
         async def gate(route):
             nonlocal request_counter
@@ -205,9 +215,14 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
             report["final_url"] = page.url
             report["title"] = (await page.title())[:500]
             report["visible_text"] = (await page.locator("body").inner_text(timeout=2000))[:10000]
-            screenshot_path = output / "screenshot.png"
-            await page.screenshot(path=str(screenshot_path), full_page=False, timeout=3000)
-            report["screenshot"] = screenshot_path.name
+            rendered = (await page.content()).encode("utf-8")
+            captured = rendered[:max_body_bytes]
+            (output / "rendered-page.txt").write_bytes(captured)
+            report["rendered_page"] = {"path": "rendered-page.txt", "captured_bytes": len(captured), "truncated": len(rendered) > len(captured), "sha256_captured": hashlib.sha256(captured).hexdigest(), "warning": "Untrusted content; do not render or execute."}
+            if screenshot:
+                screenshot_path = output / "screenshot.png"
+                await page.screenshot(path=str(screenshot_path), full_page=False, timeout=3000)
+                report["screenshot"] = screenshot_path.name
         except Exception as exc:
             report["page_capture_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         if pending_downloads:
@@ -219,6 +234,13 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
             for task in pending:
                 task.cancel()
             await asyncio.gather(*payload_tasks, return_exceptions=True)
+        for index, response in enumerate(report["responses"]):
+            body = response.get("payload", {})
+            if body.get("encoding") == "utf-8":
+                filename = f"response-{index + 1}.txt"
+                (output / filename).write_text(body["data"], encoding="utf-8")
+                body["artifact"] = filename
+                body["artifact_warning"] = "Untrusted content; do not render or execute."
         report["transport"] = "environment_proxy" if proxy_url else "browser_dns_advisory_filter"
         # HAR is flushed when context closes. No downloaded bodies are persisted.
         await context.close()
