@@ -186,3 +186,104 @@ def metadata_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: fl
     else:
         result["stop_reason"] = "redirect_limit"
     return result
+
+
+def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float = 8.0,
+               max_body_bytes: int = 262144) -> dict:
+    """Bounded GET capture, no execution; manually validate each redirect.
+
+    With an inherited HTTPS/HTTP proxy, destination resolution and address policy
+    are delegated to that proxy (never represented as pinned-IP evidence).
+    """
+    import os
+    import time
+    import urllib.request
+    import urllib.error
+    from .evidence import header_list, payload, extract_content
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    url = canonical_url(raw_url)
+    result = {'target_url': url, 'method': 'GET', 'requests': []}
+    visited = set()
+    for hop in range(max_redirects + 1):
+        if url in visited:
+            result['stop_reason'] = 'redirect_loop'
+            break
+        visited.add(url)
+        parts = urlsplit(url)
+        headers = {'User-Agent': 'URL-Forensics/0.2', 'Accept': '*/*',
+                   'Accept-Encoding': 'identity', 'Connection': 'close'}
+        record = {'id': f'http-{hop}', 'url': url, 'hop': hop,
+                  'time_utc': datetime.now(timezone.utc).isoformat(),
+                  'request': {'method': 'GET', 'url': url, 'http_version': '1.1',
+                              'target': parts.path + ('?' + parts.query if parts.query else ''),
+                              'headers': header_list([('Host', parts.netloc), *headers.items()]),
+                              'payload': {'status': 'absent'}}}
+        result['requests'].append(record)
+        started = time.monotonic()
+        conn = None
+        response = None
+        try:
+            proxy = urllib.request.getproxies().get(parts.scheme)
+            if proxy:
+                record['transport'] = {'mode': 'environment_proxy', 'dns_and_ip_policy': 'delegated to proxy',
+                                       'tls': 'verified by urllib using environment CA; proxy may inspect TLS'}
+                # Reject literal non-public addresses even when DNS is delegated.
+                try:
+                    literal = ipaddress.ip_address(parts.hostname)
+                except ValueError:
+                    literal = None
+                if literal and not is_public_ip(str(literal)):
+                    raise ProbeError('Non-public IP destination')
+                try:
+                    response = opener.open(urllib.request.Request(url, headers=headers), timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    response = exc
+                status, reason = response.code, response.reason
+                raw_headers = list(response.headers.items())
+            else:
+                ip, ips = resolve_public(url)
+                record.update(dns_ips=ips, connected_ip=ip, tls=tls_info(url, ip, timeout))
+                record['transport'] = {'mode': 'pinned_public_ip'}
+                cls = _PinnedHTTPS if parts.scheme == 'https' else _PinnedHTTP
+                conn = cls(parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80), ip, timeout)
+                conn.request('GET', record['request']['target'], headers=headers)
+                response = conn.getresponse()
+                status, reason = response.status, response.reason
+                raw_headers = response.getheaders()
+            record['headers_elapsed_ms'] = round((time.monotonic() - started) * 1000, 2)
+            data = response.read(max_body_bytes + 1)
+            selected = {k.lower(): v[:8192] for k, v in raw_headers if k.lower() in HEADERS_OF_INTEREST}
+            record['http'] = {'status': status, 'reason': str(reason), 'headers': selected,
+                              'header_list': header_list(raw_headers),
+                              'payload': payload(data, max_body_bytes, selected.get('content-type', ''))}
+            captured = record["http"]["payload"]
+            if captured["encoding"] == "utf-8":
+                record["http"]["content_indicators"] = extract_content(captured["data"], url)
+            location = selected.get('location')
+            if status not in (301, 302, 303, 307, 308) or not location:
+                result['stop_reason'] = 'final_response'
+                break
+            destination = canonical_url(urljoin(url, location))
+            dst = urlsplit(destination)
+            record['redirect'] = {'from': url, 'to': destination, 'status': status,
+                                  'cross_origin': (parts.scheme, parts.netloc) != (dst.scheme, dst.netloc),
+                                  'https_downgrade': parts.scheme == 'https' and dst.scheme == 'http'}
+            url = destination
+        except (ValueError, OSError, http.client.HTTPException) as exc:
+            record['error'] = f'{type(exc).__name__}: {exc}'
+            result['stop_reason'] = 'error'
+            break
+        finally:
+            record['elapsed_ms'] = round((time.monotonic() - started) * 1000, 2)
+            if response is not None:
+                response.close()
+            if conn is not None:
+                conn.close()
+    else:
+        result['stop_reason'] = 'redirect_limit'
+    return result

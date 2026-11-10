@@ -2,7 +2,7 @@
 
 A small **defensive URL-reconnaissance toolkit** for investigating suspicious links from a disposable Linux environment. It performs DNS/TLS/HTTP metadata inspection and can optionally observe a page in headless Chromium using Playwright.
 
-**Status:** Python CLI implemented; offline unit tests available. Live investigation of `socialsignlab.click` has **not** been performed or verified by this project. This is an **on-demand command-line program**, not a website, server, scheduled monitor, or malware-detonation sandbox.
+**Status:** Python CLI implemented; offline unit tests available. Live observations are case-specific; reports are saved outside version control. This is an **on-demand command-line program**, not a website, server, scheduled monitor, or malware-detonation sandbox.
 
 > **Security warning:** Never run this against a suspicious URL on your ordinary Windows workstation. The `browser` mode **executes website JavaScript** inside Chromium; cancelling downloads does not make a potentially exploited browser safe. Codex Cloud is convenient for installing and testing the project and for an initial metadata probe, but it is **not a hardened malware-analysis environment**. For browser visits to suspected malware delivery sites, use a **dedicated, disposable VM**, with firewall-enforced isolation, no credentials or trusted repository connections, and network monitoring. See [Security model](#security-model-and-limitations).
 
@@ -155,7 +155,7 @@ python inspect_url.py \
   --output ./reports/socialsignlab-browser-001
 ```
 
-This starts **two sequential Chromium contexts**: a Linux user-agent and a Windows user-agent, both **running on Linux**. It does **not** emulate a Windows OS or execute downloaded Windows programs. The program does not click, type, submit forms, persist downloads, or intentionally collect response bodies. An initial download response or transfer can still begin before cancellation; it is **not** a guarantee of zero-byte contact with the server.
+This starts **two sequential Chromium contexts**: a Linux user-agent and a Windows user-agent, both **running on Linux**. It does **not** emulate a Windows OS or execute downloaded Windows programs. The program does not click, type, submit forms, persist downloads, or execute downloaded programs. Browser mode now captures bounded response payload evidence. An initial download response or transfer can still begin before cancellation; it is **not** a guarantee of zero-byte contact with the server.
 
 Expected output, subject to browser/network success:
 
@@ -172,7 +172,7 @@ reports/socialsignlab-browser-001/
         └── screenshot.png
 ```
 
-The browser report records request/response metadata, resource types, statuses, limited console output, redirect relationships, blocked requests, attempted downloads and screenshots. **Do not assume the HAR is completely sanitized.** Although response bodies are omitted, attacker-controlled URLs, query parameters, and some headers may contain sensitive values. Keep these artifacts private.
+The browser report records request/response metadata, resource types, statuses, limited console output, redirect relationships, blocked requests, attempted downloads and screenshots. **Do not assume the HAR is completely sanitized.** Payloads are now captured in report.json; attacker-controlled URLs, query parameters, and some headers may contain sensitive values. Keep these artifacts private.
 
 ### CLI flags
 
@@ -194,7 +194,7 @@ The browser report records request/response metadata, resource types, statuses, 
 | Verified TLS handshake/certificate details | Yes | Yes, plus browser TLS connections |
 | HTTP HEAD and selected response headers | Yes | Yes, before browser visit |
 | Follows server HEAD redirects | Yes, limited | Yes, plus browser navigation/requests |
-| Downloads response bodies intentionally | **No** | Website responses load in Chromium; **bodies are omitted from HAR** |
+| Downloads response bodies intentionally | **No** | Website responses load in Chromium; **bounded bodies are captured in report.json; HAR bodies remain omitted** |
 | Executes website JavaScript | **No** | **Yes** |
 | Observes JS requests, page errors and screenshots | No | Yes |
 | Persists files offered for download | No | Attempts logged, downloads cancelled |
@@ -216,6 +216,11 @@ The tool's `passive` label is shorthand for **metadata-only active probing**. It
 9. **Not always online.** Codex Cloud environment publication does not launch a server, scheduled scanner, webhook, background observer, or public-facing endpoint. Trigger scans manually unless you intentionally build and secure automation later.
 
 ## Troubleshooting
+
+If Chromium is already installed by the environment, select it without downloading
+another browser by setting `URL_FORENSICS_CHROMIUM_EXECUTABLE=/usr/bin/chromium`
+before running the CLI. Leave this variable unset to use Playwright's managed
+Chromium. Browser observation still requires the isolation described above.
 
 | Symptom | Likely cause / next step |
 |---|---|
@@ -283,3 +288,58 @@ url-forensics/
 ## Roadmap
 
 This is a first-stage reconnaissance tool, not a production malware-analysis pipeline. Possible future improvements include VM-level egress-proxy enforcement, packet capture, passive certificate-transparency checks, controlled redirect graphs, browser fingerprint comparisons, threat-intelligence lookups, extracted indicators of compromise, and STIX/JSON export. Avoid adding automatic arbitrary file execution or unsafe interaction with attacker-controlled pages.
+
+
+## Agent-ready forensic capture (schema 0.2.0)
+
+Use `--mode http` for bounded GET payload capture without JavaScript, or
+`--mode browser` for GET capture followed by instrumented Chromium visits.
+`--mode passive` remains HEAD-only and never reads response bodies.
+
+```bash
+python inspect_url.py --url 'https://example.org/' --mode http --max-body-bytes 262144 --output reports/new-case
+# For an installed system Chromium:
+URL_FORENSICS_CHROMIUM_EXECUTABLE=/usr/bin/chromium python inspect_url.py --url 'https://example.org/' --mode browser --profile both --output reports/new-browser-case
+```
+
+`report.json` includes a version, UTC collection timestamps, HTTP request
+envelopes, duplicate-preserving response headers (common authentication/cookie
+headers redacted), status, timings, bounded UTF-8/base64 payloads and SHA-256
+hashes of **captured bytes**. Redirect hops identify origin changes and HTTPS
+downgrades. Static extraction preserves script/link/form targets, meta refreshes,
+and excerpts containing common shell, clipboard, extension and obfuscation
+references. These are investigative leads, not proof of malicious execution.
+Browser requests and responses share IDs, with redirect predecessor IDs,
+request failures, console/page errors, screenshots and cancelled-download events.
+Profile document destinations are compared without attributing differences to
+cloaking. JavaScript navigations appear as document requests and in captured
+page content; they are not mislabeled as HTTP redirect responses.
+
+`assessment` contains heuristic severity, JSON-pointer evidence references and
+collection gaps. `unknown` means no assessed signal, never safe. This is a small
+explainable triage ruleset, not an antivirus engine, probability model, endpoint
+compromise assessment or guarantee that every payload is collected.
+`manifest.json` hashes the report artifacts for later integrity checks; it is not
+a signed chain of custody. HAR and payloads can contain sensitive data, including
+URL query strings, echoed secrets and attacker instructions. Redaction is limited
+to named headers; keep reports private and treat all captured strings as untrusted.
+
+GET reads at most `--max-body-bytes + 1` bytes per hop, keeping at most the limit.
+Compressed HTTP bytes are retained as received (no decompression); browser bodies
+are decoded by Chromium. Playwright buffers bodies before storage truncation, so
+this limit bounds persisted evidence, **not browser RAM or network consumption**.
+Document responses are fetched through Playwright routing and fulfilled after
+capture so immediate client redirects cannot discard the source body. This can
+change network fingerprinting compared with an uninstrumented Chrome visit.
+Other responses declaring an excessive Content-Length are omitted from browser payload
+capture; unknown lengths may be buffered. Request bodies are not stored and
+non-read-only methods remain blocked. Downloads are cancelled and not executed.
+
+When inherited HTTP(S) proxy settings exist, GET and Chromium honor the proxy.
+DNS/private-address enforcement is delegated to that environment's proxy;
+reports explicitly avoid claiming pinned origin IP or end-to-end origin TLS
+certificate evidence in that mode. Without a proxy, the GET probe revalidates and
+pins public addresses at every server redirect. HEAD retains its original direct
+pinned transport. Proxy denials and failed browser requests are collection gaps,
+not evidence that a target is safe. No forms or extracted resource links are
+actively followed by the HTTP probe.
