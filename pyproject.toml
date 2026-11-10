@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "url-forensics"
+version = "0.1.0"
+description = "Defensive DNS/TLS/HTTP and disposable-browser URL reconnaissance"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+browser = ["playwright>=1.48,<2"]
+
+[project.scripts]
+url-inspect = "url_forensics.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["url_forensics*"]
