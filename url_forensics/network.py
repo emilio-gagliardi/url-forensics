@@ -188,8 +188,52 @@ def metadata_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: fl
     return result
 
 
+CHROME_MAJOR = "131"
+CLIENT_PROFILES = ("tool", "chrome-windows", "chrome-linux")
+_CHROME_ACCEPT = ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+                  "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+
+
+def client_headers(profile: str = "tool", referer: str | None = None,
+                   accept_language: str | None = None) -> dict:
+    """Request headers for the GET probe.
+
+    'tool' is the honest identifying client. The chrome-* profiles mimic the
+    header set of a top-level Chrome navigation so header-based filters can be
+    compared. They do NOT change the Python TLS fingerprint or header order,
+    and Accept-Encoding stays 'identity' so captured bytes are exact.
+    """
+    if profile not in CLIENT_PROFILES:
+        raise ValueError(f"Unknown client profile: {profile}")
+    if profile == "tool":
+        headers = {"User-Agent": "URL-Forensics/0.2", "Accept": "*/*"}
+        if accept_language:
+            headers["Accept-Language"] = accept_language
+    else:
+        windows = profile == "chrome-windows"
+        platform_token = "Windows NT 10.0; Win64; x64" if windows else "X11; Linux x86_64"
+        headers = {
+            "User-Agent": f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          f"Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
+            "Accept": _CHROME_ACCEPT,
+            "Accept-Language": accept_language or "en-CA,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "sec-ch-ua": f'"Chromium";v="{CHROME_MAJOR}", "Not_A Brand";v="24", "Google Chrome";v="{CHROME_MAJOR}"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"' if windows else '"Linux"',
+            "Sec-Fetch-Site": "cross-site" if referer else "none",
+            "Sec-Fetch-Mode": "navigate", "Sec-Fetch-User": "?1", "Sec-Fetch-Dest": "document",
+        }
+    if referer:
+        headers["Referer"] = canonical_url(referer)
+    headers["Accept-Encoding"] = "identity"
+    headers["Connection"] = "close"
+    return headers
+
+
 def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float = 8.0,
-               max_body_bytes: int = 262144) -> dict:
+               max_body_bytes: int = 262144, client_profile: str = "tool",
+               referer: str | None = None, accept_language: str | None = None) -> dict:
     """Bounded GET capture, no execution; manually validate each redirect.
 
     With an inherited HTTPS/HTTP proxy, destination resolution and address policy
@@ -207,7 +251,9 @@ def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float 
 
     opener = urllib.request.build_opener(NoRedirect)
     url = canonical_url(raw_url)
-    result = {'target_url': url, 'method': 'GET', 'requests': []}
+    result = {'target_url': url, 'method': 'GET', 'requests': [],
+              'client': {'profile': client_profile, 'referer': referer, 'accept_language': accept_language}}
+    request_headers = client_headers(client_profile, referer, accept_language)
     visited = set()
     for hop in range(max_redirects + 1):
         if url in visited:
@@ -215,8 +261,7 @@ def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float 
             break
         visited.add(url)
         parts = urlsplit(url)
-        headers = {'User-Agent': 'URL-Forensics/0.2', 'Accept': '*/*',
-                   'Accept-Encoding': 'identity', 'Connection': 'close'}
+        headers = dict(request_headers)
         record = {'id': f'http-{hop}', 'url': url, 'hop': hop,
                   'time_utc': datetime.now(timezone.utc).isoformat(),
                   'request': {'method': 'GET', 'url': url, 'http_version': '1.1',

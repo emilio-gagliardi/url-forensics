@@ -34,7 +34,9 @@ def safe_headers(headers: dict) -> dict:
 
 async def observe(raw_url: str, output: Path, profile: str = "linux",
                   timeout_ms: int = 15000, max_requests: int = 100,
-                  settle_ms: int = 2000, max_body_bytes: int = 262144, ignore_https_errors: bool = False, screenshot: bool = True) -> dict:
+                  settle_ms: int = 2000, max_body_bytes: int = 262144, ignore_https_errors: bool = False, screenshot: bool = True,
+                  referer: str | None = None, locale: str | None = None,
+                  timezone_id: str | None = None) -> dict:
     """Observe a single site visit with no clicks, form posts or stored downloads."""
     try:
         from playwright.async_api import async_playwright
@@ -49,6 +51,7 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
     output.mkdir(parents=True, exist_ok=True)
     report: dict = {
         "profile": profile, "requested_url": url, "requests": [], "responses": [],
+        "context": {"referer": referer, "locale": locale, "timezone_id": timezone_id},
         "blocked": [], "downloads_cancelled": [], "console": [], "page_errors": [],
         "websockets_blocked": [], "popups_closed": 0, "screenshot": None,
         "mode": "browser", "document_capture": "route.fetch then fulfill (may change network fingerprint)", "warning": (
@@ -76,7 +79,7 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
         context = await browser.new_context(
             user_agent=ua, accept_downloads=False, service_workers="block",
             permissions=[], ignore_https_errors=ignore_https_errors, java_script_enabled=True,
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1280, "height": 900}, locale=locale, timezone_id=timezone_id,
             record_har_path=str(output / "traffic.har"), record_har_content="omit",
             record_har_mode="full",
         )
@@ -207,7 +210,8 @@ async def observe(raw_url: str, output: Path, profile: str = "linux",
                 if len(report["page_errors"]) < 100 else None)
         page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms,
+                            referer=canonical_url(referer) if referer else None)
             await page.wait_for_timeout(min(settle_ms, 10000))
         except Exception as exc:
             report["navigation_error"] = f"{type(exc).__name__}: {str(exc)[:500]}"

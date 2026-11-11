@@ -186,6 +186,21 @@ The browser report records request/response metadata, resource types, statuses, 
 --output ./reports/new    Output must be absent or empty
 ```
 
+## Cloaking and decoy analysis (http / browser modes)
+
+Some phishing kits show scanners a harmless page and reserve the real landing page for intended victims. These options help tell the two apart and record indicators for abuse reports:
+
+```bash
+python inspect_url.py --url '<url>' --mode http --repeat 5 --matrix --output ./reports/case-001
+```
+
+- `--client-profile tool|chrome-windows|chrome-linux`, `--referer`, `--accept-language`: header sets for GET captures. The Chrome profiles mimic a top-level navigation; they do **not** change Python's TLS fingerprint or header order, and `Accept-Encoding` stays `identity` so captured bytes are exact.
+- `--matrix`: runs up to 10 GETs for each of four profiles (identifying tool, Chrome-on-Windows, Chrome-on-Windows with a Gmail referer, Chrome-on-Linux) and compares **response shapes**: the body with URLs, hex identifiers and the edge-injected Cloudflare beacon masked. A rotating redirect target alone does not count as a difference; a different shape or status does.
+- `--locale`, `--timezone`, `--referer` also apply to browser mode.
+- Reports now record the delivery stage reached (`decoy_redirect_only`, `content_observed`, `unknown`), redirect-destination counts with a small-sample pool-size estimate, and Cloudflare Web Analytics tokens. The token identifies the zone owner's Cloudflare account, so include it in abuse reports. When only a client-side redirect or decoy was seen, the triage level is `inconclusive`, not `low`.
+
+None of this proves intent. The exit IP stays constant within a run; test another network separately, from a disposable VM.
+
 ## How the probes work
 
 | Capability | `passive` | `browser` |
