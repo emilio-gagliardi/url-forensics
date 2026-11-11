@@ -113,6 +113,7 @@ def _render(report: dict) -> str:
             lines.append("")
         lines.append(f"Detailed evidence: `browser/{entry['profile']}/traffic.har`, plus `report.json`.")
         lines.append("")
+    lines.extend(_render_devtools(report.get("devtools")))
     lines.extend(["## Interpretation boundaries", "",
                   "- No malware classification or attribution can be established from these probes alone.",
                   "- Browser JavaScript can execute inside the disposable browser. Downloads are cancelled, not analyzed.",
@@ -120,6 +121,56 @@ def _render(report: dict) -> str:
                   "- A Windows user-agent is not a Windows VM; servers may still fingerprint Linux.",
                   "- A refused, blank, or error response does not demonstrate the URL is safe.", ""])
     return "\n".join(lines)
+
+
+def _render_devtools(d) -> list[str]:
+    if not d:
+        return []
+    m = _safe_markdown
+    lines = ["## DevTools recording (real Chrome)", ""]
+    if d.get("error"):
+        return lines + [f"Error: {m(d['error'])}", ""]
+    lines += [f"Browser: `{m(d['browser'].get('product'))}`; mode `{d['mode']}`, CDP level `{d['level']}`; "
+              f"headless: {d['settings']['headless']}", "",
+              f"Requests: **{len(d['requests'])}** (dropped {d['dropped_requests']}); navigations: **{len(d['navigations'])}**; "
+              f"cookies: **{len(d['cookies'])}**; downloads denied: **{len(d['downloads'])}**; popups closed: **{len(d['popups'])}**; "
+              f"dialogs dismissed: **{len(d['dialogs'])}**", ""]
+    if d.get("fingerprint_tells"):
+        lines += ["### Automation / environment tells visible to the page", ""]
+        lines += [f"- {m(t)}" for t in d["fingerprint_tells"]] + [""]
+    elif d.get("fingerprint"):
+        lines += ["No obvious automation tells in the page-visible fingerprint.", ""]
+    lines += ["### Navigations", ""]
+    for nav in d["navigations"][:60]:
+        extra = f" reason `{m(nav['reason'])}`" if nav.get("reason") else ""
+        lines.append(f"- {nav['kind']}{extra}: `{m(nav['url'])}`")
+    lines += ["", "### Requests (type, status, protocol, remote IP)", ""]
+    for req in d["requests"][:80]:
+        hop = req["hops"][-1] if req["hops"] else {}
+        resp = hop.get("response") or {}
+        init = req["initiator"]
+        origin = init.get("type") or "?"
+        if init.get("stack"):
+            origin += f" ({m(init['stack'][0].get('url') or 'inline')}:{init['stack'][0].get('line')})"
+        chain = f" ({len(req['hops'])} hops)" if len(req["hops"]) > 1 else ""
+        fail = f" FAILED {m(req['failed'].get('error'))}" if req.get("failed") else ""
+        lines.append(f"- {req['type']} {resp.get('status', '-')} {m(resp.get('protocol') or '')} {m(resp.get('remote_ip') or '')}"
+                     f"{chain}{fail} `{m(hop.get('url', ''))}` <- {origin}")
+    for title, key, fmt in (("Console and Log", "console", lambda c: f"{c['type']}: {c['text']}"),
+                            ("Page errors", "page_errors", lambda c: c["text"]),
+                            ("Hook events (clipboard, eval, dynamic navigation)", "hook_events", lambda c: f"{c['kind']}: {c['value']}"),
+                            ("Event-listener breakpoint hits", "breakpoint_hits", lambda c: f"{c['reason']} {c.get('event')}"),
+                            ("Dialogs", "dialogs", lambda c: f"{c['type']}: {c['message']}")):
+        if d.get(key):
+            lines += ["", f"### {title}", ""] + [f"- {m(fmt(c))}" for c in d[key][:40]]
+    if d.get("cookies"):
+        lines += ["", "### Cookies set (values not stored)", ""]
+        lines += [f"- `{m(c['name'])}` on `{m(c['domain'])}` secure={c['secure']} httpOnly={c['http_only']} sameSite={m(c['same_site'])}" for c in d["cookies"][:40]]
+    if d.get("artifacts"):
+        lines += ["", f"Artifacts: `{m(json.dumps(d['artifacts']))}` in `devtools/`. Full detail including headers, certificates, initiators and bodies: `report.json`.", ""]
+    for err in d.get("errors", []):
+        lines.append(f"- Collection note: {m(err)}")
+    return lines + [""]
 
 
 def run(args: argparse.Namespace) -> tuple[Path, dict]:
@@ -142,9 +193,11 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
                           referer=referer if referer is not None else args.referer,
                           accept_language=language or args.accept_language, fetch_site=fetch_site, omit_fetch=omit_fetch)
 
-    if args.mode in {"http", "browser"}:
+    attach = args.mode == "devtools" and bool(args.cdp_endpoint)
+    http_modes = {"http", "browser"} | ({"devtools"} if not attach else set())
+    if args.mode in http_modes:
         report["http"] = probe()
-    if args.mode in {"http", "browser"} and args.repeat > 1:
+    if args.mode in http_modes and args.repeat > 1:
         captures = [report["http"]] + [probe() for _ in range(args.repeat - 1)]
         report["http_repeats"] = captures
         hashes, targets = {}, {}
@@ -162,7 +215,7 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
                 if hop.get("redirect"):
                     targets.setdefault(hop["redirect"]["to"], []).append(i + 1)
         report["repeat_comparison"] = {"body_hashes": hashes, "redirect_targets": targets, "limitation": "Same configuration; variability does not prove cloaking or identify its cause."}
-    if args.matrix and args.mode in {"http", "browser"}:
+    if args.matrix and args.mode in http_modes:
         per_cell = min(10, max(args.repeat, 5))
         captures_by_cell = [[] for _ in MATRIX_CELLS]
         schedule = [i for i in range(len(MATRIX_CELLS)) for _ in range(per_cell)]
@@ -196,6 +249,18 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
                 result = {"profile": profile, "error": f"{type(exc).__name__}: {str(exc)[:500]}",
                           "requests": [], "responses": [], "blocked": [], "downloads_cancelled": []}
             report["browser"].append(result)
+    if args.mode == "devtools":
+        from .devtools import record
+        try:
+            report["devtools"] = asyncio.run(record(
+                url, output / "devtools", level=args.cdp_level, chrome_path=args.chrome_path,
+                headless=args.headless, no_sandbox=args.chrome_no_sandbox, timeout_ms=int(args.timeout * 1000),
+                settle_ms=args.settle_ms, max_requests=args.max_requests, max_body_bytes=args.max_body_bytes,
+                referer=args.referer, locale=args.locale, timezone_id=args.timezone,
+                ignore_https_errors=args.ignore_https_errors, screenshot=args.screenshot,
+                endpoint=args.cdp_endpoint, observe_seconds=args.observe_seconds))
+        except Exception as exc:
+            report["devtools"] = {"error": f"{type(exc).__name__}: {str(exc)[:500]}", "requests": [], "responses": []}
     from .evidence import analyze
     report["assessment"] = analyze(report)
     (output / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -212,8 +277,8 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect public URLs in a disposable cloud environment")
     parser.add_argument("--url", required=True, help="Public http(s) URL. Never supply credentials.")
-    parser.add_argument("--mode", choices=["passive", "http", "browser"], default="passive",
-                        help="passive=DNS/TLS/HEAD; http=bounded GET payloads; browser=GET plus JS-enabled Chromium")
+    parser.add_argument("--mode", choices=["passive", "http", "browser", "devtools"], default="passive",
+                        help="passive=DNS/TLS/HEAD; http=bounded GET payloads; browser=GET plus JS-enabled Chromium; devtools=real Chrome recorded over CDP (needs a disposable VM)")
     parser.add_argument("--output", default="./reports/inspection", help="New/empty report directory")
     parser.add_argument("--profile", choices=["linux", "windows-ua", "both"], default="both")
     parser.add_argument("--timeout", type=float, default=12.0, help="Per-network step timeout in seconds")
@@ -232,11 +297,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timezone", default=None, help="Browser timezone id, e.g. America/Edmonton")
     parser.add_argument("--matrix", action="store_true",
                         help="Compare response shapes across header/referrer profiles (http/browser modes; max 8 x 10 GETs)")
+    parser.add_argument("--cdp-level", choices=["quiet", "full"], default="quiet",
+                        help="quiet: network/page/log only (fewest CDP tells); full: also Runtime, Debugger, clipboard breakpoints, JS hooks")
+    parser.add_argument("--chrome-path", default=None, help="Chrome executable (default: auto-detect)")
+    parser.add_argument("--headless", action="store_true", help="Run Chrome headless (more detectable; default is headed)")
+    parser.add_argument("--chrome-no-sandbox", action="store_true", help="Pass --no-sandbox (only inside disposable containers)")
+    parser.add_argument("--cdp-endpoint", default=None,
+                        help="Passive attach: record a Chrome you started with --remote-debugging-port (localhost only)")
+    parser.add_argument("--observe-seconds", type=float, default=30.0, help="Attach mode: how long to record")
+    parser.add_argument("--i-am-in-a-disposable-vm", action="store_true", dest="disposable",
+                        help="Required for --mode devtools: confirms this machine is a disposable VM/sandbox")
     args = parser.parse_args(argv)
+    if args.mode == "devtools":
+        import os
+        if not (args.disposable or os.environ.get("URL_FORENSICS_DISPOSABLE") == "1"):
+            from .devtools import SAFE_FLAG_MESSAGE
+            parser.error(SAFE_FLAG_MESSAGE)
+        if args.cdp_endpoint:
+            from .devtools import validate_endpoint
+            try:
+                validate_endpoint(args.cdp_endpoint)
+            except ValueError as exc:
+                parser.error(str(exc))
+    elif args.cdp_endpoint or args.headless:
+        parser.error("--cdp-endpoint/--headless apply to --mode devtools")
     if not 1 <= args.repeat <= 10:
         parser.error("repeat must be 1-10")
     if args.matrix and args.mode == "passive":
-        parser.error("--matrix needs --mode http or browser")
+        parser.error("--matrix needs --mode http, browser or devtools")
     if not 1 <= args.max_body_bytes <= 1048576:
         parser.error("max-body-bytes must be 1–1048576")
     if args.timeout < 1 or args.timeout > 60 or not 1 <= args.max_requests <= 500 or not 0 <= args.max_redirects <= 12 or not 0 <= args.settle_ms <= 10000:
@@ -250,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
     for browser in report["browser"]:
         if browser.get("error"):
             print(f"Browser [{browser['profile']}] error: {browser['error']}", file=sys.stderr)
+    if report.get("devtools", {}).get("error"):
+        print(f"DevTools error: {report['devtools']['error']}", file=sys.stderr)
+        return 1
     return 0 if not any(item.get("error") for item in report["browser"]) else 1
 
 
