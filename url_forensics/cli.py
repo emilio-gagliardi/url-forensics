@@ -6,6 +6,7 @@ import hashlib
 import asyncio
 import json
 import re
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,10 +18,14 @@ from .evidence import (_final_response, destination_stats, is_decoy_page, page_d
                        response_shape)
 
 MATRIX_CELLS = (
-    ('tool, no referer', 'tool', None),
-    ('chrome-windows, no referer', 'chrome-windows', None),
-    ('chrome-windows, Gmail referer', 'chrome-windows', 'https://mail.google.com/'),
-    ('chrome-linux, no referer', 'chrome-linux', None),
+    ('tool, no referer', 'tool', None, None, False),
+    ('tool, Gmail referer', 'tool', 'https://mail.google.com/', None, False),
+    ('chrome-windows, no referer', 'chrome-windows', None, None, False),
+    ('chrome-windows, Gmail referer', 'chrome-windows', 'https://mail.google.com/', None, False),
+    ('chrome-windows, cross-site only', 'chrome-windows', None, 'cross-site', False),
+    ('chrome-windows, Google referer', 'chrome-windows', 'https://www.google.com/', None, False),
+    ('chrome-windows, Gmail without fetch headers', 'chrome-windows', 'https://mail.google.com/', None, True),
+    ('chrome-linux, no referer', 'chrome-linux', None, None, False),
 )
 
 
@@ -130,12 +135,12 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
         "metadata": metadata_probe(url, max_redirects=args.max_redirects, timeout=args.timeout) if args.mode == "passive" else {},
         "browser": [],
     }
-    def probe(profile=None, referer=None, language=None):
+    def probe(profile=None, referer=None, language=None, fetch_site=None, omit_fetch=False):
         return http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout,
                           max_body_bytes=args.max_body_bytes,
                           client_profile=profile or args.client_profile,
                           referer=referer if referer is not None else args.referer,
-                          accept_language=language or args.accept_language)
+                          accept_language=language or args.accept_language, fetch_site=fetch_site, omit_fetch=omit_fetch)
 
     if args.mode in {"http", "browser"}:
         report["http"] = probe()
@@ -159,13 +164,21 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
         report["repeat_comparison"] = {"body_hashes": hashes, "redirect_targets": targets, "limitation": "Same configuration; variability does not prove cloaking or identify its cause."}
     if args.matrix and args.mode in {"http", "browser"}:
         per_cell = min(10, max(args.repeat, 5))
+        captures_by_cell = [[] for _ in MATRIX_CELLS]
+        schedule = [i for i in range(len(MATRIX_CELLS)) for _ in range(per_cell)]
+        random.SystemRandom().shuffle(schedule)
+        for sequence, i in enumerate(schedule, 1):
+            label, profile, referer, fetch_site, omit_fetch = MATRIX_CELLS[i]
+            capture = probe(profile=profile, referer=referer or "", language=None,
+                            fetch_site=fetch_site, omit_fetch=omit_fetch)
+            capture["matrix_sequence"] = sequence
+            captures_by_cell[i].append(capture)
+            time.sleep(0.25)
         cells = []
-        for label, profile, referer in MATRIX_CELLS:
-            captures = []
-            for _ in range(per_cell):
-                captures.append(probe(profile=profile, referer=referer or "", language=None))
-                time.sleep(0.25)
-            cells.append(_cell_summary(label, profile, referer, captures))
+        for (label, profile, referer, fetch_site, omit_fetch), captures in zip(MATRIX_CELLS, captures_by_cell):
+            cell = _cell_summary(label, profile, referer, captures)
+            cell.update(fetch_site=fetch_site, omit_fetch=omit_fetch, observations=captures)
+            cells.append(cell)
         report["matrix"] = {"captures_per_cell": per_cell, "cells": cells,
                             "limitation": "Header-level differences only: Python's TLS fingerprint and header order are unchanged, and the exit IP is constant."}
     if args.mode == "browser":
@@ -218,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--locale", default=None, help="Browser locale, e.g. en-CA")
     parser.add_argument("--timezone", default=None, help="Browser timezone id, e.g. America/Edmonton")
     parser.add_argument("--matrix", action="store_true",
-                        help="Compare response shapes across header/referrer profiles (http/browser modes; max 4 x 10 GETs)")
+                        help="Compare response shapes across header/referrer profiles (http/browser modes; max 8 x 10 GETs)")
     args = parser.parse_args(argv)
     if not 1 <= args.repeat <= 10:
         parser.error("repeat must be 1-10")

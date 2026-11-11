@@ -169,3 +169,12 @@ class ReviewRegressionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class CloudflareShapeNormalizationTests(unittest.TestCase):
+    def test_volatile_error_fields_do_not_change_shape(self):
+        from url_forensics.evidence import response_shape
+        template = '<h1>Error 520</h1><span>Cloudflare Ray ID: <strong>{ray}</strong></span><span>Your IP: {ip}</span><div>{date} UTC</div>'
+        one = template.format(ray='abcde12345abcdef', ip='192.0.2.1', date='2026-11-11 00:20:01')
+        two = template.format(ray='12345abcdef12345', ip='198.51.100.1', date='2026-11-11 00:30:02')
+        self.assertEqual(response_shape(one), response_shape(two))
+        self.assertNotEqual(response_shape(one), response_shape(two.replace('Error 520', 'Error 403')))
