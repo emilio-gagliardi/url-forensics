@@ -1,0 +1,22 @@
+[
+  {
+    "path": "devtools/dom-0.html.txt",
+    "bytes": 7085,
+    "sha256": "1c5180aca113bca937270975134d010d57184b1a3e1ecdadfc80be06465c3b91"
+  },
+  {
+    "path": "devtools/screenshot-0.png",
+    "bytes": 26480,
+    "sha256": "4a8c869761afb6bc6b1af70291466763738b9446cf26fd52d17c665fe1269c31"
+  },
+  {
+    "path": "report.json",
+    "bytes": 122850,
+    "sha256": "d1bb8691ab1217429f4c17b0a83e67bd372edc34bf37a7beb6ca952519d031db"
+  },
+  {
+    "path": "report.md",
+    "bytes": 3664,
+    "sha256": "24e9bab0c222afcbc30b3ade23cb99629ee2e79304caa0bb3a0ab0c5aa927ae3"
+  }
+]
