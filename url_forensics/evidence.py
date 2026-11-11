@@ -57,7 +57,9 @@ def analyze(report):
         body = response.get('payload', {})
         if body.get('truncated'):
             gaps.append({'evidence': ref + '/http/payload', 'reason': 'Payload capture was bounded; hash covers captured bytes only.'})
-    if probe.get('stop_reason') != 'final_response':
+    devtools = report.get('devtools')
+    attach_only = bool(devtools) and not probe
+    if probe.get('stop_reason') != 'final_response' and not attach_only:
         gaps.append({'evidence': '/http' if 'http' in report else '/metadata', 'reason': probe.get('stop_reason', 'missing probe')})
     if report['mode'] == 'passive':
         gaps.append({'evidence': '/mode', 'reason': 'HEAD only: no payload or JavaScript behavior observed.'})
@@ -81,11 +83,45 @@ def analyze(report):
             add('attempted_download', 'high', ref + '/downloads_cancelled', 'Browser attempted a download; content was not analyzed.')
         if browser.get('blocked'):
             gaps.append({'evidence': ref + '/blocked', 'reason': 'Blocked traffic limits observed behavior; inspect individual reasons.'})
+    if devtools:
+        if devtools.get('error'):
+            gaps.append({'evidence': '/devtools/error', 'reason': devtools['error']})
+        for err in devtools.get('errors', []):
+            gaps.append({'evidence': '/devtools/errors', 'reason': err})
+        for i, req in enumerate(devtools.get('requests', [])):
+            if req.get('failed'):
+                gaps.append({'evidence': f'/devtools/requests/{i}/failed',
+                             'reason': 'Request failed: ' + str(req['failed'].get('error') or req['failed'].get('blocked_reason'))})
+            body = req.get('body') or {}
+            if body.get('status') == 'unavailable':
+                gaps.append({'evidence': f'/devtools/requests/{i}/body', 'reason': 'Response body unavailable: ' + body.get('reason', '')})
+        if devtools.get('downloads'):
+            add('attempted_download', 'high', '/devtools/downloads', 'Chrome attempted a download; it was denied and not analyzed.')
+        for i, hit in enumerate(devtools.get('hook_events', [])):
+            if hit.get('kind') == 'writeText' or (hit.get('kind') == 'execCommand' and str(hit.get('value', '')).lower() in ('copy', 'cut')):
+                add('clipboard_write_attempt', 'high', f'/devtools/hook_events/{i}', 'Page tried to write to the clipboard (ClickFix pattern). Review the value.')
+                break
+        for i, hit in enumerate(devtools.get('breakpoint_hits', [])):
+            if hit.get('event') in ('copy', 'cut'):
+                add('clipboard_event_listener', 'medium', f'/devtools/breakpoint_hits/{i}', 'A copy/cut handler ran, which pages can use to alter clipboard contents. Review hook events.')
+                break
+        if devtools.get('popups'):
+            add('popup_opened', 'medium', '/devtools/popups', 'Page tried to open a new window; it was closed.')
+        if devtools.get('dialogs'):
+            add('javascript_dialog', 'low', '/devtools/dialogs', 'Page raised a JavaScript dialog; it was dismissed.')
+        reasons = {n.get('reason') for n in devtools.get('navigations', []) if n.get('kind') == 'requested'}
+        if reasons & {'scriptInitiated', 'metaTagRefresh', 'httpHeaderRefresh'}:
+            add('client_navigation', 'info', '/devtools/navigations', 'Client-side navigation observed (' + ', '.join(sorted(r for r in reasons if r)) + ').')
+        if devtools.get('fingerprint_tells'):
+            add('automation_tells_visible', 'info', '/devtools/fingerprint_tells',
+                'The page could see: ' + '; '.join(devtools['fingerprint_tells'][:6]) + '. A filter may have treated this visit as automated.')
+        if devtools.get('cookies'):
+            add('cookies_set', 'info', '/devtools/cookies', f"{len(devtools['cookies'])} cookie(s) set; names only are stored.")
     profiles = {b.get('profile'): sorted({q['url'] for q in b.get('requests', []) if q.get('type') == 'document'}) for b in report.get('browser', [])}
     if len(profiles) > 1 and len({tuple(v) for v in profiles.values()}) > 1:
         add('profile_behavior_difference', 'medium', '/browser', 'Document destinations differ between profile visits; timing, randomization or fingerprinting could explain this. No cloaking attribution established.')
     captures = report.get('http_repeats') or ([report['http']] if report.get('http') else [])
-    stage, destinations, identifiers = delivery_stage(captures, report.get('browser', []))
+    stage, destinations, identifiers = delivery_stage(captures, list(report.get('browser', [])) + ([devtools] if devtools and not devtools.get('error') else []))
     hosts = {safe_host(d) for d in destinations}
     if stage == 'decoy_redirect_only' and len(hosts) > 1:
         add('varying_client_redirect', 'medium', '/http_repeats' if report.get('http_repeats') else '/http',

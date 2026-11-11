@@ -186,6 +186,26 @@ The browser report records request/response metadata, resource types, statuses, 
 --output ./reports/new    Output must be absent or empty
 ```
 
+## Real-Chrome DevTools recorder (`--mode devtools`)
+
+Records what the Chrome DevTools panels would show, from an installed, normal Chrome, so the visit looks as little like automation as possible. It never clicks, types or submits (the client refuses `Input.*`), denies downloads, closes popups and dismisses dialogs. **It executes page JavaScript on the machine it runs on: use a disposable VM (for example Windows Sandbox) with no credentials.**
+
+```bash
+pip install -e '.[devtools]'
+python -m url_forensics.cli --url https://example.test/ --mode devtools --i-am-in-a-disposable-vm \
+  --output reports/devtools-001 --cdp-level quiet
+```
+
+Captured: every request with initiator and redirect hops, raw headers (cookie values redacted, cookie names kept), protocol, remote IP, certificate, timing, response bodies, navigation reasons (`metaTagRefresh`, `scriptInitiated`, ...), console/log/exceptions, cookies, storage, DOM, screenshot, frame tree, and a fingerprint self-report with the automation tells a filter could have seen.
+
+- `--cdp-level quiet` (default): Network, Page, Log only. Fewest detectable CDP traits.
+- `--cdp-level full`: also Runtime, Debugger (all scripts, including eval'd sources), clipboard event breakpoints and JS hooks. Sites can detect some of this.
+- Headed by default; `--headless` is easier to detect. `--chrome-path`, `--chrome-no-sandbox` (disposable containers only).
+- `--cdp-endpoint http://127.0.0.1:9222 --observe-seconds 60`: passive attach to a Chrome you started yourself (`--remote-debugging-port`), loopback only. Use this to browse manually and record.
+- `--timezone` overrides use CDP emulation and are themselves a tell; the report says so.
+
+Limits: CDP traits remain detectable, bodies can be unavailable after fast navigations, and a cloaker keyed on IP reputation will still see the same exit IP.
+
 ## Cloaking and decoy analysis (http / browser modes)
 
 Some phishing kits show scanners a harmless page and reserve the real landing page for intended victims. These options help tell the two apart and record indicators for abuse reports:
