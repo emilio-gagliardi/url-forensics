@@ -102,7 +102,7 @@ def analyze(report):
                 add('clipboard_write_attempt', 'high', f'/devtools/hook_events/{i}', 'Page tried to write to the clipboard (ClickFix pattern). Review the value.')
                 break
         for i, hit in enumerate(devtools.get('breakpoint_hits', [])):
-            if hit.get('event') in ('copy', 'cut'):
+            if str(hit.get('event', '')).removeprefix('listener:') in ('copy', 'cut'):
                 add('clipboard_event_listener', 'medium', f'/devtools/breakpoint_hits/{i}', 'A copy/cut handler ran, which pages can use to alter clipboard contents. Review hook events.')
                 break
         if devtools.get('popups'):

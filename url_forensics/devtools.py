@@ -452,7 +452,7 @@ class CdpRecorder:
             frames = [{"function": f.get("functionName", "")[:128], "url": str(f.get("url", ""))[:2048],
                        "line": (f.get("location") or {}).get("lineNumber")}
                       for f in (params.get("callFrames") or [])[:5]]
-            self.breakpoint_hits.append({"reason": params.get("reason"), "event": data.get("eventName"),
+            self.breakpoint_hits.append({"reason": params.get("reason"), "event": str(data.get("eventName", "")).removeprefix("listener:") or None,
                                          "frames": frames})
         return [{"kind": "cdp", "method": "Debugger.resume", "params": {}, "session": session}]
 
@@ -564,7 +564,7 @@ async def record(raw_url: str, output: Path, *, level: str = "quiet", chrome_pat
     loop = asyncio.get_running_loop()
     pending: set[asyncio.Task] = set()
     sessions: dict[str, str] = {}      # sessionId -> targetId
-    attaching: set[str] = set()
+    attaching: dict[str, asyncio.Future] = {}
     connection: CdpConnection | None = None
     proc = None
     profile_dir = None
@@ -590,7 +590,7 @@ async def record(raw_url: str, output: Path, *, level: str = "quiet", chrome_pat
         if method in {"Target.targetCreated", "Target.targetInfoChanged"} and endpoint is not None:
             info = params.get("targetInfo") or {}
             if info.get("type") == "page":
-                task = loop.create_task(attach(info["targetId"]))
+                task = loop.create_task(attach_quietly(info["targetId"]))
                 pending.add(task)
                 task.add_done_callback(pending.discard)
         for action in recorder.on_event(method, params, session):
@@ -616,14 +616,27 @@ async def record(raw_url: str, output: Path, *, level: str = "quiet", chrome_pat
                 await send("DOMDebugger.setEventListenerBreakpoint", {"eventName": event_name})
 
     async def attach(target_id: str) -> str | None:
+        """Attach once per target; concurrent callers share the same session."""
         if target_id in attaching:
-            return None
-        attaching.add(target_id)
-        result = await connection.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
-        session = result["sessionId"]
-        sessions[session] = target_id
-        await enable(session)
-        return session
+            return await asyncio.shield(attaching[target_id])
+        attaching[target_id] = loop.create_future()
+        try:
+            result = await connection.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+            session = result["sessionId"]
+            sessions[session] = target_id
+            await enable(session)
+            attaching[target_id].set_result(session)
+            return session
+        except BaseException as exc:
+            attaching[target_id].set_exception(exc) if not attaching[target_id].done() else None
+            attaching[target_id].exception()  # mark retrieved
+            raise
+
+    async def attach_quietly(target_id: str) -> None:
+        try:
+            await attach(target_id)
+        except Exception:
+            pass
 
     try:
         if endpoint:
@@ -758,10 +771,11 @@ async def record(raw_url: str, output: Path, *, level: str = "quiet", chrome_pat
         return result
     finally:
         if connection is not None:
-            try:
-                await connection.send("Browser.close", timeout=5)
-            except Exception:
-                pass
+            if proc is not None:  # never close a browser the recorder did not launch
+                try:
+                    await connection.send("Browser.close", timeout=5)
+                except Exception:
+                    pass
             await connection.close()
         if proc is not None:
             try:

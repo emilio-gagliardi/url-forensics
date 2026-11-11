@@ -76,6 +76,7 @@ class RecorderTests(unittest.TestCase):
         act = rec.on_event("Debugger.paused", {"reason": "EventListener", "data": {"eventName": "listener:copy"}, "callFrames": []}, "S")
         self.assertEqual(act[0]["method"], "Debugger.resume")
         out = rec.summary()
+        self.assertEqual(out["breakpoint_hits"][0]["event"], "copy")
         self.assertEqual((len(out["popups"]), len(out["dialogs"]), len(out["downloads"])), (1, 1, 1))
 
     def test_popups_kept_in_attach_mode(self):
@@ -110,6 +111,13 @@ class RecorderTests(unittest.TestCase):
         self.assertTrue({"attempted_download", "clipboard_write_attempt", "client_navigation", "cookies_set", "automation_tells_visible"} <= codes)
         self.assertEqual(result["risk_level"], "high")
         self.assertFalse(any("stop_reason" in str(g) or g["reason"] == "missing probe" for g in result["collection_gaps"]))
+
+    def test_listener_breakpoint_produces_finding(self):
+        rec = CdpRecorder()
+        rec.on_event("Debugger.paused", {"reason": "EventListener", "data": {"eventName": "listener:copy"}, "callFrames": []}, "S")
+        d = rec.summary(); d.update(cookies=[], fingerprint_tells=[], errors=[])
+        codes = {f["code"] for f in analyze({"mode": "devtools", "devtools": d, "browser": []})["findings"]}
+        self.assertIn("clipboard_event_listener", codes)
 
     def test_devtools_error_is_a_gap_not_safe(self):
         result = analyze({"mode": "devtools", "devtools": {"error": "boom", "requests": [], "responses": []}, "browser": []})
