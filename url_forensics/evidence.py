@@ -101,7 +101,7 @@ def analyze(report):
             add('matrix_response_difference', 'medium', '/matrix',
                 'Different client profiles received different (status, response shape) sets: '
                 + '; '.join(f'{k}: {len(v)} shape(s)' for k, v in signatures.items())
-                + '. This is evidence that the server varies its response by client attributes.')
+                + '. Association only; time, proxy or other factors may also explain the differences.')
         elif signatures:
             gaps.append({'evidence': '/matrix', 'reason': 'All profiles received the same response shapes; none of the tested header/referrer combinations changed the response.'})
     levels = {'info': 0, 'low': 1, 'medium': 2, 'high': 3}
@@ -229,6 +229,14 @@ def response_shape(text):
     different shape means genuinely different content, not a rotated URL.
     """
     masked = _CF_SCRIPT_RE.sub('', text)
+    # Normalize common volatile Cloudflare error-page fields, retaining page text.
+    masked = re.sub(r'(?i)(ray id\s*:?\s*(?:</?[^>]+>\s*)*)([0-9a-f]{16,32}(?:-[A-Z]{3})?)', r'\1RAY_ID', masked)
+    masked = re.sub(r'(?i)(data-translate=[\"\']your_ip[\"\'][^>]*>\s*(?:</?[^>]+>\s*)*)([^<]+)', r'\1IP_ADDRESS', masked)
+    masked = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', 'IP_ADDRESS', masked)
+    masked = re.sub(r'\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F:]{0,4}\b', 'IP_ADDRESS', masked)
+    masked = re.sub(r'\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*UTC|Z|[+-]\d{2}:?\d{2})?\b', 'TIMESTAMP', masked)
+    masked = re.sub(r'(?i)\b[0-9a-f]{16,32}-[a-z]{3}\b', 'RAY_ID', masked)
+    masked = re.sub(r'(?i)(<strong[^>]*>\s*)[0-9a-f]{16,32}(\s*</strong>)', r'\1RAY_ID\2', masked)
     masked = _URL_RE.sub('URL', masked)
     masked = re.sub(r'\b[0-9a-f]{32}\b', 'HEX', masked, flags=re.I)
     return hashlib.sha256(masked.strip().encode('utf-8', errors='replace')).hexdigest()

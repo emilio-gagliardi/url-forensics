@@ -195,7 +195,7 @@ _CHROME_ACCEPT = ("text/html,application/xhtml+xml,application/xml;q=0.9,image/a
 
 
 def client_headers(profile: str = "tool", referer: str | None = None,
-                   accept_language: str | None = None) -> dict:
+                   accept_language: str | None = None, fetch_site: str | None = None, omit_fetch: bool = False) -> dict:
     """Request headers for the GET probe.
 
     'tool' is the honest identifying client. The chrome-* profiles mimic the
@@ -224,6 +224,10 @@ def client_headers(profile: str = "tool", referer: str | None = None,
             "Sec-Fetch-Site": "cross-site" if referer else "none",
             "Sec-Fetch-Mode": "navigate", "Sec-Fetch-User": "?1", "Sec-Fetch-Dest": "document",
         }
+    if omit_fetch:
+        headers = {key: value for key, value in headers.items() if not key.lower().startswith('sec-fetch-')}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
     if referer:
         headers["Referer"] = canonical_url(referer)
     headers["Accept-Encoding"] = "identity"
@@ -233,7 +237,8 @@ def client_headers(profile: str = "tool", referer: str | None = None,
 
 def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float = 8.0,
                max_body_bytes: int = 262144, client_profile: str = "tool",
-               referer: str | None = None, accept_language: str | None = None) -> dict:
+               referer: str | None = None, accept_language: str | None = None,
+               fetch_site: str | None = None, omit_fetch: bool = False) -> dict:
     """Bounded GET capture, no execution; manually validate each redirect.
 
     With an inherited HTTPS/HTTP proxy, destination resolution and address policy
@@ -253,7 +258,7 @@ def http_probe(raw_url: str, max_redirects: int = MAX_REDIRECTS, timeout: float 
     url = canonical_url(raw_url)
     result = {'target_url': url, 'method': 'GET', 'requests': [],
               'client': {'profile': client_profile, 'referer': referer, 'accept_language': accept_language}}
-    request_headers = client_headers(client_profile, referer, accept_language)
+    request_headers = client_headers(client_profile, referer, accept_language, fetch_site, omit_fetch)
     visited = set()
     for hop in range(max_redirects + 1):
         if url in visited:
