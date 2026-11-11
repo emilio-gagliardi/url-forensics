@@ -33,8 +33,10 @@ def _cell_summary(label, profile, referer, captures):
             errors += 1
             continue
         body = response.get('payload', {})
-        text = body.get('data', '') if body.get('encoding') == 'utf-8' else ''
-        shape = response_shape(text) if text else 'non-text'
+        if body.get('encoding') == 'utf-8':
+            shape = 'text:' + response_shape(body.get('data', ''))
+        else:
+            shape = 'binary:' + str(body.get('sha256_captured', 'unknown'))
         statuses[response['status']] = statuses.get(response['status'], 0) + 1
         signatures.add(f"{response['status']}:{shape}")
         sizes.append(body.get('captured_bytes', 0))

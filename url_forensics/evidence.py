@@ -85,8 +85,8 @@ def analyze(report):
     if len(profiles) > 1 and len({tuple(v) for v in profiles.values()}) > 1:
         add('profile_behavior_difference', 'medium', '/browser', 'Document destinations differ between profile visits; timing, randomization or fingerprinting could explain this. No cloaking attribution established.')
     captures = report.get('http_repeats') or ([report['http']] if report.get('http') else [])
-    stage, destinations, identifiers = delivery_stage(captures)
-    hosts = {urlsplit(d).hostname for d in destinations}
+    stage, destinations, identifiers = delivery_stage(captures, report.get('browser', []))
+    hosts = {safe_host(d) for d in destinations}
     if stage == 'decoy_redirect_only' and len(hosts) > 1:
         add('varying_client_redirect', 'medium', '/http_repeats' if report.get('http_repeats') else '/http',
             f'{len(destinations)} captures with an identical response template redirected to {len(hosts)} different '
@@ -107,7 +107,8 @@ def analyze(report):
     levels = {'info': 0, 'low': 1, 'medium': 2, 'high': 3}
     ranked = [f['severity'] for f in findings if f['severity'] != 'info']
     highest = max(ranked, key=levels.get, default='unknown')
-    if highest in ('unknown', 'low') and (stage == 'decoy_redirect_only' or any(f['code'] == 'client_redirect' for f in findings)):
+    if (highest in ('unknown', 'low') and stage != 'content_observed'
+            and (stage == 'decoy_redirect_only' or any(f['code'] == 'client_redirect' for f in findings))):
         highest = 'inconclusive'
     return {'risk_level': highest,
             'basis': 'Highest observed heuristic severity; not a malware probability or safety verdict. '
@@ -148,8 +149,26 @@ def page_destination(response):
     return None
 
 
-def delivery_stage(captures):
-    """Classify what the captures reached: decoy only, other content, or unknown."""
+def browser_landing_candidates(browsers, decoy_hosts):
+    """Successful HTML document responses seen in a browser that are neither decoy stubs nor decoy targets."""
+    found = []
+    for i, browser in enumerate(browsers or []):
+        for j, response in enumerate(browser.get('responses', [])):
+            body = response.get('payload', {})
+            ctype = str(response.get('headers', {}).get('content-type', '')).lower()
+            if (response.get('status') != 200 or body.get('encoding') != 'utf-8' or 'html' not in ctype
+                    or is_decoy_page(response) or safe_host(response.get('url', '')) in decoy_hosts):
+                continue
+            found.append({'evidence': f'/browser/{i}/responses/{j}', 'url': response.get('url', '')[:2048]})
+    return found
+
+
+def delivery_stage(captures, browsers=()):
+    """Classify what was reached: decoy only, other content, or unknown.
+
+    Browser document responses count as content unless they come from a host that
+    the HTTP captures showed to be a decoy destination (e.g. a news site).
+    """
     finals = [r for r in (_final_response(c) for c in captures) if r]
     destinations, identifiers = [], []
     for response in finals:
@@ -160,6 +179,8 @@ def delivery_stage(captures):
             dest = page_destination(response)
             if dest:
                 destinations.append(dest)
+    if browser_landing_candidates(browsers, {safe_host(d) for d in destinations}):
+        return 'content_observed', destinations, identifiers
     if not finals:
         return 'unknown', destinations, identifiers
     if len(destinations) == len(finals):
@@ -177,6 +198,22 @@ _JS_NAV_RE = re.compile(r'''(?:\blocation(?:\.href)?\s*=(?!=)|\blocation\.(?:rep
 _CF_BEACON_RE = re.compile(r'''data-cf-beacon\s*=\s*['"]?\{[^}]*?["']token["']\s*:\s*["']([0-9a-f]{32})["']''', re.I)
 _URL_RE = re.compile(r'https?://[^\s"\'<>)\\]+')
 _CF_SCRIPT_RE = re.compile(r'<script[^>]*cloudflareinsights[^>]*>\s*</script>', re.I)
+
+
+def safe_host(url):
+    """Host of an untrusted URL string; malformed values are kept as evidence, never raised."""
+    try:
+        return urlsplit(url).hostname or url[:200]
+    except ValueError:
+        return 'malformed:' + url[:200]
+
+
+def safe_urljoin(base, url):
+    from urllib.parse import urljoin
+    try:
+        return urljoin(base, url)
+    except ValueError:
+        return url
 
 
 def refresh_destination(content):
@@ -204,7 +241,7 @@ def destination_stats(destinations):
     selection rule is random.
     """
     from collections import Counter
-    hosts = [(urlsplit(d).hostname or d) for d in destinations if d]
+    hosts = [safe_host(d) for d in destinations if d]
     counts = Counter(hosts)
     f1 = sum(1 for c in counts.values() if c == 1)
     f2 = sum(1 for c in counts.values() if c == 2)
@@ -218,7 +255,7 @@ def destination_stats(destinations):
 def extract_content(text, base_url):
     """Extract inert indicators; never fetch links or interpret page instructions."""
     from html.parser import HTMLParser
-    from urllib.parse import urljoin, parse_qs
+    from urllib.parse import parse_qs
     class Indicators(HTMLParser):
         def __init__(self):
             super().__init__()
@@ -240,14 +277,18 @@ def extract_content(text, base_url):
                         pass
                 src = attrs.get('src') or ''
                 if 'cloudflareinsights.com' in src:
-                    for value in parse_qs(urlsplit(src).query).get('token', []):
+                    try:
+                        tokens = parse_qs(urlsplit(src).query).get('token', [])
+                    except ValueError:
+                        tokens = []
+                    for value in tokens:
                         self.add_identifier(value, 'beacon src query')
             if len(self.items) >= 200:
                 return
             for attr in ('src', 'href', 'action'):
                 if attrs.get(attr):
                     self.items.append({'tag': tag, 'attribute': attr,
-                                       'url': urljoin(base_url, attrs[attr])[:4096]})
+                                       'url': safe_urljoin(base_url, attrs[attr])[:4096]})
             if tag == 'meta' and attrs.get('http-equiv', '').lower() == 'refresh':
                 self.items.append({'tag': 'meta', 'refresh': attrs.get('content', '')[:4096]})
             if tag == 'input' and attrs.get('type', '').lower() == 'password':
@@ -269,7 +310,7 @@ def extract_content(text, base_url):
                             'excerpt': text[max(0, match.start()-80):match.end()+160]})
     for nav in _JS_NAV_RE.finditer(text):
         if len(parser.items) < 200:
-            parser.items.append({'tag': 'script', 'js_navigation': urljoin(base_url, nav.group(1))[:4096]})
+            parser.items.append({'tag': 'script', 'js_navigation': safe_urljoin(base_url, nav.group(1))[:4096]})
     for token in _CF_BEACON_RE.findall(text):
         parser.add_identifier(token, 'data-cf-beacon (raw text)')
     return {'links_and_forms': parser.items, 'patterns': matches, 'identifiers': parser.identifiers,

@@ -125,5 +125,47 @@ class HeaderTests(unittest.TestCase):
             client_headers('chrome-linux', referer='file:///etc/passwd')
 
 
+def browser_response(url, html, ctype='text/html; charset=utf-8', status=200):
+    body = payload(html.encode(), 262144, ctype)
+    return {'url': url, 'status': status, 'headers': {'content-type': ctype}, 'payload': body,
+            'content_indicators': extract_content(body['data'], url)}
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def test_browser_landing_page_changes_delivery_stage(self):
+        login = '<html><body><form action="/post"><input type="password"></form></body></html>'
+        report = {'mode': 'browser', 'http': capture(decoy('https://www.example.org/')),
+                  'browser': [{'profile': 'linux', 'requests': [], 'responses': [
+                      browser_response('https://landing.test/login', login)]}]}
+        a = analyze(report)
+        self.assertEqual(a['delivery_stage'], 'content_observed')
+        self.assertNotEqual(a['risk_level'], 'inconclusive')
+
+    def test_browser_arrival_at_decoy_target_is_not_a_landing_page(self):
+        news = '<html><body><h1>News</h1>' + 'x' * 3000 + '</body></html>'
+        report = {'mode': 'browser', 'http': capture(decoy('https://www.example.org/')),
+                  'browser': [{'profile': 'linux', 'requests': [], 'responses': [
+                      browser_response('https://www.example.org/', news)]}]}
+        self.assertEqual(analyze(report)['delivery_stage'], 'decoy_redirect_only')
+
+    def test_malformed_destinations_do_not_abort_analysis(self):
+        html = decoy('http://[')
+        content = extract_content(html, 'https://x.test/')
+        self.assertTrue(content['links_and_forms'])
+        stats = destination_stats(['http://[', 'https://ok.test/'])
+        self.assertEqual(stats['distinct'], 2)
+        a = analyze({'mode': 'http', 'http': capture(html), 'http_repeats': [capture(html), capture(decoy('https://ok.test/'))]})
+        self.assertIn('varying_client_redirect', [f['code'] for f in a['findings']])
+
+    def test_binary_and_empty_text_signatures_are_distinct(self):
+        def cap(data, ctype):
+            return {'requests': [{'http': {'status': 200, 'payload': payload(data, 1000, ctype)}}]}
+        image = _cell_summary('a', 'tool', None, [cap(b'\x00\x01', 'application/octet-stream')])['signatures']
+        exe = _cell_summary('b', 'tool', None, [cap(b'MZ\x90\x00', 'application/octet-stream')])['signatures']
+        empty = _cell_summary('c', 'tool', None, [cap(b'', 'text/html')])['signatures']
+        self.assertEqual(len({image[0], exe[0], empty[0]}), 3)
+        self.assertTrue(empty[0].startswith('200:text:'))
+
+
 if __name__ == '__main__':
     unittest.main()
