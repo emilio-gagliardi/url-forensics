@@ -7,11 +7,42 @@ import asyncio
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .network import ProbeError, canonical_url, metadata_probe, http_probe
+from .network import ProbeError, canonical_url, metadata_probe, http_probe, CLIENT_PROFILES
+from .evidence import (_final_response, destination_stats, is_decoy_page, page_destination,
+                       response_shape)
+
+MATRIX_CELLS = (
+    ('tool, no referer', 'tool', None),
+    ('chrome-windows, no referer', 'chrome-windows', None),
+    ('chrome-windows, Gmail referer', 'chrome-windows', 'https://mail.google.com/'),
+    ('chrome-linux, no referer', 'chrome-linux', None),
+)
+
+
+def _cell_summary(label, profile, referer, captures):
+    """Summarize one matrix cell by response shape, not by (rotating) destination."""
+    signatures, statuses, sizes, destinations, errors = set(), {}, [], [], 0
+    for capture in captures:
+        response = _final_response(capture)
+        if not response:
+            errors += 1
+            continue
+        body = response.get('payload', {})
+        text = body.get('data', '') if body.get('encoding') == 'utf-8' else ''
+        shape = response_shape(text) if text else 'non-text'
+        statuses[response['status']] = statuses.get(response['status'], 0) + 1
+        signatures.add(f"{response['status']}:{shape}")
+        sizes.append(body.get('captured_bytes', 0))
+        if is_decoy_page(response) and page_destination(response):
+            destinations.append(page_destination(response))
+    return {'label': label, 'client_profile': profile, 'referer': referer, 'captures': len(captures),
+            'errors': errors, 'statuses': statuses, 'body_bytes': [min(sizes), max(sizes)] if sizes else None,
+            'signatures': sorted(signatures), 'destinations': destination_stats(destinations)}
 
 
 def _safe_markdown(value: object) -> str:
@@ -24,6 +55,22 @@ def _render(report: dict) -> str:
              "## Metadata probe", ""]
     a = report.get("assessment", {})
     lines.extend(["## Risk triage", "", f"Observed risk: **{a.get('risk_level', 'unknown')}**", "", a.get("basis", ""), ""])
+    lines.extend([f"Delivery stage observed: **{_safe_markdown(a.get('delivery_stage', 'unknown'))}**", ""])
+    for ident in a.get("identifiers", []):
+        lines.append(f"- Indicator `{_safe_markdown(ident['kind'])}`: `{_safe_markdown(ident['token'])}` (from {_safe_markdown(ident['source'])})")
+    stats = a.get("destination_stats") or {}
+    if stats.get("samples"):
+        lines.extend(["", f"Client-side redirect destinations: {stats['samples']} samples, {stats['distinct']} distinct hosts, "
+                      f"estimated pool about {stats['estimated_pool_size']}. " + _safe_markdown(stats['limitation']), ""])
+        lines.extend(f"- `{_safe_markdown(host)}`: {count}" for host, count in stats["counts"].items())
+        lines.append("")
+    matrix = report.get("matrix")
+    if matrix:
+        lines.extend(["### Client profile matrix", "", "| Profile | Captures | Statuses | Body bytes | Response shapes | Distinct destinations |", "|---|---:|---|---|---:|---:|"])
+        for cell in matrix["cells"]:
+            lines.append(f"| {_safe_markdown(cell['label'])} | {cell['captures']} | {_safe_markdown(cell['statuses'])} | "
+                         f"{_safe_markdown(cell['body_bytes'])} | {len(cell['signatures'])} | {cell['destinations']['distinct']} |")
+        lines.append("")
     for finding in a.get("findings", []):
         lines.append(f"- **{finding['severity']} / {finding['code']}**: {_safe_markdown(finding['detail'])} (`{_safe_markdown(finding['evidence'])}`)")
     lines.extend(["", "### Collection gaps", ""])
@@ -81,11 +128,17 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
         "metadata": metadata_probe(url, max_redirects=args.max_redirects, timeout=args.timeout) if args.mode == "passive" else {},
         "browser": [],
     }
+    def probe(profile=None, referer=None, language=None):
+        return http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout,
+                          max_body_bytes=args.max_body_bytes,
+                          client_profile=profile or args.client_profile,
+                          referer=referer if referer is not None else args.referer,
+                          accept_language=language or args.accept_language)
+
     if args.mode in {"http", "browser"}:
-        report["http"] = http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout,
-                                    max_body_bytes=args.max_body_bytes)
+        report["http"] = probe()
     if args.mode in {"http", "browser"} and args.repeat > 1:
-        captures = [report["http"]] + [http_probe(url, max_redirects=args.max_redirects, timeout=args.timeout, max_body_bytes=args.max_body_bytes) for _ in range(args.repeat - 1)]
+        captures = [report["http"]] + [probe() for _ in range(args.repeat - 1)]
         report["http_repeats"] = captures
         hashes, targets = {}, {}
         for i, capture in enumerate(captures):
@@ -97,9 +150,22 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
                 for item in response.get("content_indicators", {}).get("links_and_forms", []):
                     if item.get("refresh"):
                         targets.setdefault(item["refresh"], []).append(i + 1)
+                    if item.get("js_navigation"):
+                        targets.setdefault(item["js_navigation"], []).append(i + 1)
                 if hop.get("redirect"):
                     targets.setdefault(hop["redirect"]["to"], []).append(i + 1)
         report["repeat_comparison"] = {"body_hashes": hashes, "redirect_targets": targets, "limitation": "Same configuration; variability does not prove cloaking or identify its cause."}
+    if args.matrix and args.mode in {"http", "browser"}:
+        per_cell = min(10, max(args.repeat, 5))
+        cells = []
+        for label, profile, referer in MATRIX_CELLS:
+            captures = []
+            for _ in range(per_cell):
+                captures.append(probe(profile=profile, referer=referer or "", language=None))
+                time.sleep(0.25)
+            cells.append(_cell_summary(label, profile, referer, captures))
+        report["matrix"] = {"captures_per_cell": per_cell, "cells": cells,
+                            "limitation": "Header-level differences only: Python's TLS fingerprint and header order are unchanged, and the exit IP is constant."}
     if args.mode == "browser":
         from .browser import observe
         profiles = ["linux", "windows-ua"] if args.profile == "both" else [args.profile]
@@ -109,7 +175,8 @@ def run(args: argparse.Namespace) -> tuple[Path, dict]:
                 result = asyncio.run(observe(url, target_dir, profile=profile,
                                   timeout_ms=int(args.timeout * 1000), max_requests=args.max_requests,
                                   settle_ms=args.settle_ms, max_body_bytes=args.max_body_bytes,
-                                  ignore_https_errors=args.ignore_https_errors, screenshot=args.screenshot))
+                                  ignore_https_errors=args.ignore_https_errors, screenshot=args.screenshot,
+                                  referer=args.referer, locale=args.locale, timezone_id=args.timezone))
             except Exception as exc:
                 result = {"profile": profile, "error": f"{type(exc).__name__}: {str(exc)[:500]}",
                           "requests": [], "responses": [], "blocked": [], "downloads_cancelled": []}
@@ -142,9 +209,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ignore-https-errors", action="store_true", help="Allow invalid browser TLS certificates")
     parser.add_argument("--screenshot", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--repeat", type=int, default=1, help="Number of HTTP captures (1-10)")
+    parser.add_argument("--client-profile", choices=CLIENT_PROFILES, default="tool",
+                        help="Header set for GET captures: tool (identifying) or Chrome-like navigation headers")
+    parser.add_argument("--referer", default=None, help="Referer to send, e.g. https://mail.google.com/")
+    parser.add_argument("--accept-language", default=None, help="Accept-Language value, e.g. en-CA,en;q=0.9")
+    parser.add_argument("--locale", default=None, help="Browser locale, e.g. en-CA")
+    parser.add_argument("--timezone", default=None, help="Browser timezone id, e.g. America/Edmonton")
+    parser.add_argument("--matrix", action="store_true",
+                        help="Compare response shapes across header/referrer profiles (http/browser modes; max 4 x 10 GETs)")
     args = parser.parse_args(argv)
     if not 1 <= args.repeat <= 10:
         parser.error("repeat must be 1-10")
+    if args.matrix and args.mode == "passive":
+        parser.error("--matrix needs --mode http or browser")
     if not 1 <= args.max_body_bytes <= 1048576:
         parser.error("max-body-bytes must be 1–1048576")
     if args.timeout < 1 or args.timeout > 60 or not 1 <= args.max_requests <= 500 or not 0 <= args.max_redirects <= 12 or not 0 <= args.settle_ms <= 10000:
